@@ -18,6 +18,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
+QUANT = os.environ.get("EXPLORER_QUANT", "")  # "4bit" or "8bit": bitsandbytes weights on CUDA, for small cards
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
     "and by the twelfth century the town had a market, a bridge, and a quarrel with its neighbours over tolls. "
@@ -27,6 +28,22 @@ REFERENCE_TEXT = (
 
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+
+
+def _weight(mod):
+    """A linear layer's weight as a plain [out, in] tensor, dequantized when bitsandbytes holds it packed
+    (EXPLORER_QUANT); otherwise the parameter itself."""
+    w = mod.weight
+    if getattr(w, "quant_state", None) is not None:  # 4-bit
+        import bitsandbytes.functional as bnbf
+        return bnbf.dequantize_4bit(w.data, w.quant_state).to(torch.bfloat16)
+    if w.dtype == torch.int8:  # 8-bit: int8 rows and each row's absmax, moved to mod.state after the first forward
+        import bitsandbytes.functional as bnbf
+        scb = w.SCB if getattr(w, "SCB", None) is not None else getattr(getattr(mod, "state", None), "SCB", None)
+        if scb is None:
+            raise RuntimeError(f"8-bit weight without its row scales: {mod}")
+        return bnbf.int8_vectorwise_dequant(w.data, scb).to(torch.bfloat16)
+    return w
 
 
 def _locked(f):
@@ -76,7 +93,14 @@ class Runtime:
             self.status = "loading"
             dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
             self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
+            if QUANT and dev == "cuda":
+                from transformers import BitsAndBytesConfig
+                q = (BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
+                     if QUANT == "4bit" else BitsAndBytesConfig(load_in_8bit=True))
+                m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16, quantization_config=q,
+                                                                    device_map={"": 0}).eval()
+            else:
+                m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
             self.dev, self.model, self.lm = dev, m, m.model.language_model
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
@@ -142,7 +166,8 @@ class Runtime:
             if self._capture_heads is not None:  # each head's write into the residual: |W_O[:, head] . out_head|
                 x = inp[0][0]
                 xv = x.view(x.shape[0], n_heads, -1)
-                W = mod.weight.view(mod.weight.shape[0], n_heads, -1)
+                w = _weight(mod)
+                W = w.view(w.shape[0], n_heads, -1)
                 self._capture_heads["writes"][i] = torch.einsum("thd,ohd->tho", xv, W).float().norm(dim=-1).cpu()  # [T, H]
                 self._capture_heads["y"][i] = xv.transpose(0, 1).half()  # [H, T, D]: each head's output
             mine = [x for x in self._heads if x[0] == i] if self._heads else []
@@ -283,14 +308,14 @@ class Runtime:
         me = self.lm.layers[layer]
         with torch.inference_mode():
             x, rms = c["x"][layer][pos].float(), c["rms"][layer][pos]
-            wg, wu = me.mlp.gate_proj.weight[n].float(), me.mlp.up_proj.weight[n].float()
+            wg, wu = _weight(me.mlp.gate_proj)[n].float(), _weight(me.mlp.up_proj)[n].float()
             g, u = wg @ x, wu @ x
             sg = torch.sigmoid(g)
             J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * (1 + me.post_attention_layernorm.weight.float()) / rms
             out, T = [], {}
             for l in range(layer + 1):
                 lay = self.lm.layers[l]
-                W = (lay.self_attn.o_proj if hasattr(lay, "self_attn") else lay.linear_attn.out_proj).weight.float()
+                W = _weight(lay.self_attn.o_proj if hasattr(lay, "self_attn") else lay.linear_attn.out_proj).float()
                 y = c["y"][l][:, pos].float()  # [H, D]
                 t = (W.T @ J).view(y.shape)
                 T[l] = t
@@ -358,17 +383,18 @@ class Runtime:
                 a = lay.self_attn; hd = a.head_dim
                 nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
                 kv = head // (nq // nkv)
-                WV = a.v_proj.weight[kv * hd:(kv + 1) * hd].float() * g
-                WO = a.o_proj.weight[:, head * hd:(head + 1) * hd].float()
-                WQ = a.q_proj.weight.view(nq, 2 * hd, -1)[head, :hd].float() * g
-                WK = a.k_proj.weight[kv * hd:(kv + 1) * hd].float() * g
+                WV = _weight(a.v_proj)[kv * hd:(kv + 1) * hd].float() * g
+                WO = _weight(a.o_proj)[:, head * hd:(head + 1) * hd].float()
+                WQ = _weight(a.q_proj).view(nq, 2 * hd, -1)[head, :hd].float() * g
+                WK = _weight(a.k_proj)[kv * hd:(kv + 1) * hd].float() * g
             else:
                 a = lay.linear_attn; hd = a.head_v_dim
-                WV = a.in_proj_qkv.weight[2 * a.key_dim + head * hd: 2 * a.key_dim + (head + 1) * hd].float() * g
-                WO = a.out_proj.weight[:, head * hd:(head + 1) * hd].float() * a.norm.weight.float()
+                Wqkv = _weight(a.in_proj_qkv)
+                WV = Wqkv[2 * a.key_dim + head * hd: 2 * a.key_dim + (head + 1) * hd].float() * g
+                WO = _weight(a.out_proj)[:, head * hd:(head + 1) * hd].float() * a.norm.weight.float()
                 kh, kd = head // (a.num_v_heads // a.num_k_heads), a.head_k_dim
-                WQ = a.in_proj_qkv.weight[kh * kd:(kh + 1) * kd].float() * g
-                WK = a.in_proj_qkv.weight[a.key_dim + kh * kd:a.key_dim + (kh + 1) * kd].float() * g
+                WQ = Wqkv[kh * kd:(kh + 1) * kd].float() * g
+                WK = Wqkv[a.key_dim + kh * kd:a.key_dim + (kh + 1) * kd].float() * g
             # orthonormal bases of the read and write spaces, so a share is a plain projection length
             QV = torch.linalg.qr(WV.T.cpu())[0].to(WV.device)  # [hidden, hd]
             QO = torch.linalg.qr(WO.cpu())[0].to(WO.device)
@@ -382,7 +408,7 @@ class Runtime:
             QK = torch.linalg.qr(WK.T.cpu())[0].to(WK.device)
             reads, rq, rk, wr = [], [], [], []
             for l in range(layer):
-                D = self.lm.layers[l].mlp.down_proj.weight.float()  # [hidden, N]
+                D = _weight(self.lm.layers[l].mlp.down_proj).float()  # [hidden, N]
                 dn = D.norm(dim=0).clamp(min=1e-8)
                 reads.append(((QV.T @ D).norm(dim=0) / dn).cpu())
                 rq.append(((QQ.T @ D).norm(dim=0) / dn).cpu())
@@ -390,7 +416,7 @@ class Runtime:
             for l in range(layer, len(self.lm.layers)):
                 L2 = self.lm.layers[l]
                 w = 1.0 + L2.post_attention_layernorm.weight.float()
-                G, U = L2.mlp.gate_proj.weight.float() * w, L2.mlp.up_proj.weight.float() * w
+                G, U = _weight(L2.mlp.gate_proj).float() * w, _weight(L2.mlp.up_proj).float() * w
                 share = lambda R: (R @ QO).norm(dim=1) / R.norm(dim=1).clamp(min=1e-8)
                 wr.append((share(G) * share(U)).cpu())
             out = {}
@@ -420,12 +446,14 @@ class Runtime:
                 if hasattr(lay, "self_attn"):
                     a = lay.self_attn; hd = a.head_dim
                     nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
-                    heads = [(a.v_proj.weight[(h // (nq // nkv)) * hd:(h // (nq // nkv) + 1) * hd].float() * g,
-                              a.o_proj.weight[:, h * hd:(h + 1) * hd].float()) for h in range(nq)]
+                    Wv, Wo = _weight(a.v_proj), _weight(a.o_proj)
+                    heads = [(Wv[(h // (nq // nkv)) * hd:(h // (nq // nkv) + 1) * hd].float() * g,
+                              Wo[:, h * hd:(h + 1) * hd].float()) for h in range(nq)]
                 else:
                     a = lay.linear_attn; hd = a.head_v_dim; o = 2 * a.key_dim
-                    heads = [(a.in_proj_qkv.weight[o + h * hd:o + (h + 1) * hd].float() * g,
-                              a.out_proj.weight[:, h * hd:(h + 1) * hd].float() * a.norm.weight.float())
+                    Wqkv, Wo = _weight(a.in_proj_qkv), _weight(a.out_proj)
+                    heads = [(Wqkv[o + h * hd:o + (h + 1) * hd].float() * g,
+                              Wo[:, h * hd:(h + 1) * hd].float() * a.norm.weight.float())
                              for h in range(a.num_v_heads)]
                 for h, (WV, WO) in enumerate(heads):
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
@@ -442,9 +470,9 @@ class Runtime:
         QV, QO, spans = self._head_bases()
         with self.lock, torch.inference_mode():
             me = self.lm.layers[layer]
-            d = me.mlp.down_proj.weight[:, n].float()
+            d = _weight(me.mlp.down_proj)[:, n].float()
             w = 1.0 + me.post_attention_layernorm.weight.float()
-            gr, ur = me.mlp.gate_proj.weight[n].float() * w, me.mlp.up_proj.weight[n].float() * w
+            gr, ur = _weight(me.mlp.gate_proj)[n].float() * w, _weight(me.mlp.up_proj)[n].float() * w
             pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
             pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
         dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
@@ -483,15 +511,17 @@ class Runtime:
                         a = lay.self_attn; hd = a.head_dim
                         nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
                         if role == "q":
-                            Wq = a.q_proj.weight.view(nq, 2 * hd, -1)[:, :hd]
+                            Wq = _weight(a.q_proj).view(nq, 2 * hd, -1)[:, :hd]
                             units = [(Wq[h], [h]) for h in range(nq)]
                         else:
                             rep = nq // nkv
-                            units = [(a.k_proj.weight[kv * hd:(kv + 1) * hd], list(range(kv * rep, (kv + 1) * rep))) for kv in range(nkv)]
+                            Wk = _weight(a.k_proj)
+                            units = [(Wk[kv * hd:(kv + 1) * hd], list(range(kv * rep, (kv + 1) * rep))) for kv in range(nkv)]
                     else:
                         a = lay.linear_attn; hd = a.head_k_dim; rep = a.num_v_heads // a.num_k_heads
                         o = 0 if role == "q" else a.key_dim
-                        units = [(a.in_proj_qkv.weight[o + kh * hd:o + (kh + 1) * hd], list(range(kh * rep, (kh + 1) * rep)))
+                        Wqkv = _weight(a.in_proj_qkv)
+                        units = [(Wqkv[o + kh * hd:o + (kh + 1) * hd], list(range(kh * rep, (kh + 1) * rep)))
                                  for kh in range(a.num_k_heads)]
                     for W, hs in units:
                         cols.append(torch.linalg.qr((W.float() * g).T.cpu())[0].half())
@@ -509,7 +539,7 @@ class Runtime:
         qk = self._qk_bases()
         zs = self.neuron_heads(layer, n)
         with self.lock, torch.inference_mode():
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+            d = _weight(self.lm.layers[layer].mlp.down_proj)[:, n].float()
             dn = float(d.norm())
             proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items()}
         roles = {}
@@ -564,7 +594,7 @@ class Runtime:
         return v
 
     def down_col(self, layer, n):
-        return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+        return _weight(self.lm.layers[layer].mlp.down_proj)[:, n].float()
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
@@ -833,20 +863,20 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
+            d = _weight(self.lm.layers[layer].mlp.down_proj)[:, n]
             me = self.lm.layers[layer]
             scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
-            r_g = me.mlp.gate_proj.weight[n] * scale_me
-            r_u = me.mlp.up_proj.weight[n] * scale_me
+            r_g = _weight(me.mlp.gate_proj)[n] * scale_me
+            r_u = _weight(me.mlp.up_proj)[n] * scale_me
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
                     v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
-                    g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
+                    g, u = (_weight(Lyr.mlp.gate_proj) @ v).float(), (_weight(Lyr.mlp.up_proj) @ v).float()
                     side = "down"
                 else:
-                    W = Lyr.mlp.down_proj.weight
+                    W = _weight(Lyr.mlp.down_proj)
                     g, u = (r_g @ W).float(), (r_u @ W).float()
                     side = "up"
                 prod = g * u
@@ -865,7 +895,7 @@ class Runtime:
                     c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
                     c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
             elif every and lens_k:
-                D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
+                D = torch.stack([_weight(self.lm.layers[c["layer"]].mlp.down_proj)[:, c["n"]] for c in every])
                 logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
@@ -890,7 +920,7 @@ class Runtime:
         for li, layer in enumerate(self.lm.layers):
             self.status = f"indexing lens {li}/{L}"
             with self.lock, torch.inference_mode():
-                W = layer.mlp.down_proj.weight  # [hidden, inter]
+                W = _weight(layer.mlp.down_proj)  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
                     logits = self.model.lm_head(self.lm.norm(D))[:, 0]

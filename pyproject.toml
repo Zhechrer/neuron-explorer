@@ -14,3 +14,16 @@ dependencies = [
     "sentence-transformers>=6.1.0",
     "umap-learn>=0.5.12",
 ]
+
+[project.optional-dependencies]
+# EXPLORER_QUANT=4bit|8bit: bitsandbytes weights on small CUDA cards (uv sync --extra gpu)
+gpu = ["bitsandbytes>=0.50.2"]
+
+[tool.uv.sources]
+# PyPI's Windows torch wheels are CPU-only
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
