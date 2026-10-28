@@ -245,9 +245,48 @@ async def reads(req: Request):
     return await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", True))
 
 
+MAX_RECIPE = 64  # neurons pushed at once by one experiment
+
+
+def _sampling(b):
+    """Sampling settings from a request body, as runtime.steer_multi takes them (greedy unless temperature is set)."""
+    return {"temperature": float(b.get("temperature") or 0), "repetition_penalty": float(b.get("repetition_penalty") or 1.0),
+            "seed": int(b.get("seed") or 0), "min_p": float(b.get("min_p") or 0)}
+
+
+def _recipe(items):
+    """An experiment's neurons [{layer, n, mode, dose}] as steer_multi pushes [(layer, n, dose, mode)], checked against
+    the model's shape; (pushes, error)."""
+    if not isinstance(items, list) or not 0 < len(items) <= MAX_RECIPE:
+        return None, f"give 1 to {MAX_RECIPE} neurons"
+    pushes, seen = [], set()
+    for x in items:
+        try:
+            l, n, dose, mode = int(x["layer"]), int(x["n"]), float(x["dose"]), x.get("mode", "add")
+        except (KeyError, TypeError, ValueError):
+            return None, f"each neuron needs layer, n and dose: {x!r}"
+        if not (0 <= l < ARCH["n_layers"] and 0 <= n < ARCH["inter"]):
+            return None, f"L{l} N{n} is outside the model ({ARCH['n_layers']} layers of {ARCH['inter']} neurons)"
+        if mode not in ("add", "mul") or not np.isfinite(dose):
+            return None, f"L{l} N{n}: mode must be add or mul and dose a finite number"
+        if (l, n) in seen:
+            return None, f"L{l} N{n} is in the experiment twice"
+        seen.add((l, n))
+        pushes.append((l, n, dose, mode))
+    return pushes, None
+
+
 @app.post("/api/steer")
 async def steer(req: Request):
+    """Three rows in one batch: pushed, unsteered, pushed the other way. One neuron (layer, n, dose, mode), as the
+    chat sends, or an experiment: neurons [{layer, n, mode, dose}] all pushed together in row 0 (row 2 reverses each),
+    with optional sampling (temperature, repetition_penalty, seed, min_p) shared by every row."""
     b = await req.json()
+    pushes = None
+    if "neurons" in b:
+        pushes, err = _recipe(b["neurons"])
+        if err:
+            return JSONResponse({"error": err}, status_code=400)
     loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
 
     def work():
@@ -259,8 +298,12 @@ async def steer(req: Request):
                 for turn in b.get("history", []):
                     msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
                 rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
-            for row, delta in rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
-                                              b.get("mode", "add"), int(b.get("max_new", 300)), cancel):
+            if pushes:
+                gen = rt.steer_multi(pushes, rows, int(b.get("max_new", 300)), cancel, **_sampling(b))
+            else:
+                gen = rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
+                                      b.get("mode", "add"), int(b.get("max_new", 300)), cancel)
+            for row, delta in gen:
                 loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
         except Exception as e:  # surfaced in the UI next to the chat
             loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
@@ -893,8 +936,7 @@ async def agent_steer(req: Request):
     items = b.get("neurons") or [{"layer": b["layer"], "n": b["n"]}]
     pushes = [(int(x["layer"]), int(x["n"]), float(x.get("dose", dose)), x.get("mode", mode)) for x in items]
 
-    samp = {"temperature": float(b.get("temperature") or 0), "repetition_penalty": float(b.get("repetition_penalty") or 1.0),
-            "seed": int(b.get("seed") or 0), "min_p": float(b.get("min_p") or 0)}
+    samp = _sampling(b)
 
     def work():
         for row, delta in rt.steer_multi(pushes, [[{"role": "user", "content": b["prompt"]}]] * 3, int(b.get("max_new", 150)), **samp):
