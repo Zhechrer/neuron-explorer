@@ -215,6 +215,34 @@ body.list-hidden #layer-back { left: 56px; }
 
 .turn .col .lab { display: block; font: 11px var(--mono); color: var(--dim); margin-bottom: 4px; }
 
+/* experiment: a recipe on top, baseline vs experiment runs in the middle, composer at the bottom */
+#x-open { font-size: 12px; color: var(--dim); flex: none; }
+#x-open:hover { color: var(--ink); }
+#f-exp { margin-left: auto; font-size: 11px; color: var(--dim); }
+#f-exp.on { color: #59ff8c; }
+#f-exp + #f-close { margin-left: 0; }
+#tab-experiment.on { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 12px; }
+#x-recipe { flex: none; max-height: 40%; overflow-y: auto; margin-bottom: 12px; }
+.x-empty { font-size: 13px; }
+.x-item { display: flex; align-items: center; gap: 8px; padding: 3px 0 3px 10px; margin-bottom: 4px; box-shadow: inset 2px 0 0 #59ff8c; }
+.x-item.muted { box-shadow: inset 2px 0 0 #ff3833; }
+.x-item.off { box-shadow: inset 2px 0 0 var(--faint); opacity: .55; }
+.x-item .x-id { font-size: 12.5px; flex: none; }
+.x-item .x-id:hover { color: var(--sel); }
+.x-item .x-name { flex: 1; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.x-item .x-dose { width: 5.4em; text-align: right; padding: 3px 6px; }
+.x-item .x-del { color: var(--dim); font-size: 16px; line-height: 1; padding: 0 4px; }
+.x-item .x-del:hover { color: var(--ink); }
+#x-runs { flex: 1; overflow-y: auto; min-height: 0; padding-right: 4px; }
+.turn .cols.x-cols { grid-template-columns: 1fr 1fr; }
+@media (max-width: 760px) { .turn .cols.x-cols { grid-template-columns: 1fr; } }
+#x-form { margin: 10px 0 0; }
+#x-form .row { display: flex; gap: 8px; margin-top: 8px; }
+#x-controls { display: flex; gap: 14px; align-items: center; font-size: 13px; }
+#x-msg { margin-right: auto; color: #e06c6c; font-size: 12px; }
+#x-input { flex: 1; padding: 8px 10px; }
+#x-go { background: var(--raise); padding: 0 16px; border-radius: 4px; min-width: 64px; }
+
 #lens-q { width: 260px; }
 .rows li.res .tk { color: var(--ink); font-family: var(--mono); font-size: 12px; margin-right: 6px; }
 

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Neuron Explorer</title>
-<link rel="stylesheet" href="style.css?v=67">
+<link rel="stylesheet" href="style.css?v=68">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -25,6 +25,7 @@
   <input id="jump" placeholder="L22 N2742" aria-label="go to neuron" spellcheck="false" data-i18n-aria-label="header.jump">
   <span class="seg" id="q-mode"><button data-q="lens" class="on" data-i18n="header.lens">lens</button><button data-q="fires" data-i18n="header.fires">fires</button></span>
   <input id="lens-q" placeholder="search lens" aria-label="search" spellcheck="false" autocomplete="off" data-i18n-placeholder="header.searchLens" data-i18n-aria-label="header.search">
+  <button id="x-open" class="mono" title="show the experiment" data-i18n-title="exp.headerTitle"><span data-i18n="exp.header">experiment</span><span class="x-count"></span></button>
   <span id="status" class="mono"></span>
   <select id="lang" aria-label="Language" title="Language" data-i18n-aria-label="header.language" data-i18n-title="header.language">
     <option value="en">EN</option>
@@ -51,7 +52,7 @@
 
   <aside id="list" class="float">
     <div id="focus-head">
-      <div class="id-line"><span id="f-id" class="mono"></span><span id="f-rank" class="mono dim"></span><button id="f-close" aria-label="close neuron" data-i18n-aria-label="focus.close">×</button></div>
+      <div class="id-line"><span id="f-id" class="mono"></span><span id="f-rank" class="mono dim"></span><button id="f-exp" class="mono" title="add this neuron to the experiment, with the chat's mode and dose" data-i18n-title="exp.addTitle"></button><button id="f-close" aria-label="close neuron" data-i18n-aria-label="focus.close">×</button></div>
       <textarea id="f-name" rows="1" placeholder="name" spellcheck="false" aria-label="feature name" data-i18n-placeholder="focus.name" data-i18n-aria-label="focus.featureName"></textarea>
     </div>
     <nav id="ltabs"><button data-lt="net" class="on" data-i18n="list.net">net</button><button data-lt="run" data-i18n="list.run">run</button><button id="list-hide" class="edge" aria-label="hide list" data-i18n-aria-label="list.hide">‹</button></nav>
@@ -81,7 +82,7 @@
   <button id="list-tab" class="tab-edge left" aria-label="show list" data-i18n-aria-label="list.show">›</button>
   <button id="focus-tab" class="tab-edge right mono" aria-label="show neuron" data-i18n-aria-label="tabs.showNeuron"></button>
   <aside id="focus" class="float">
-    <nav id="tabs"><button data-tab="examples" class="on" data-i18n="tabs.examples">Examples</button><button data-tab="chat" data-i18n="tabs.chat">Chat</button><button data-tab="details" data-i18n="tabs.details">Details</button><button data-tab="claude">Claude</button><select id="a-agent" class="mono dim" title="agent for new conversations" data-i18n-title="tabs.agent"><option value="claude">claude</option><option value="codex">codex</option></select><button id="a-past" class="mono dim" title="past conversations" data-i18n-title="tabs.pastTitle" data-i18n="tabs.past">past</button><button id="a-new" class="mono dim" title="start a new conversation" data-i18n-title="tabs.newTitle" data-i18n="tabs.new">new</button><button id="f-collapse" class="edge" aria-label="collapse" data-i18n-aria-label="tabs.collapse">›</button></nav>
+    <nav id="tabs"><button data-tab="examples" class="on" data-i18n="tabs.examples">Examples</button><button data-tab="chat" data-i18n="tabs.chat">Chat</button><button data-tab="details" data-i18n="tabs.details">Details</button><button data-tab="experiment"><span data-i18n="tabs.experiment">Experiment</span><span class="x-count"></span></button><button data-tab="claude">Claude</button><select id="a-agent" class="mono dim" title="agent for new conversations" data-i18n-title="tabs.agent"><option value="claude">claude</option><option value="codex">codex</option></select><button id="a-past" class="mono dim" title="past conversations" data-i18n-title="tabs.pastTitle" data-i18n="tabs.past">past</button><button id="a-new" class="mono dim" title="start a new conversation" data-i18n-title="tabs.newTitle" data-i18n="tabs.new">new</button><button id="f-collapse" class="edge" aria-label="collapse" data-i18n-aria-label="tabs.collapse">›</button></nav>
     <div id="tab-examples" class="tab on"></div>
     <div id="tab-chat" class="tab">
       <div id="c-lens"></div>
@@ -98,6 +99,14 @@
       </form>
     </div>
     <div id="tab-details" class="tab"></div>
+    <div id="tab-experiment" class="tab">
+      <div id="x-recipe"></div>
+      <div id="x-runs"></div>
+      <form id="x-form">
+        <div id="x-controls"><span id="x-msg"></span><button type="button" id="x-clear-runs" class="dim" data-i18n="exp.clearRuns">clear results</button><button type="button" id="x-clear" class="dim" data-i18n="exp.clear">clear experiment</button></div>
+        <div class="row"><input id="x-input" placeholder="Who are you?" autocomplete="off" data-i18n-placeholder="chat.who"><button id="x-go" type="submit" data-i18n="chat.run">run</button></div>
+      </form>
+    </div>
     <div id="tab-claude" class="tab">
       <div id="a-thread"><div class="a-empty dim" data-i18n-html="agent.empty">Ask anything about the model, or open a neuron and press <b>explain</b>.</div></div>
       <div id="a-actions"></div>
@@ -106,6 +115,6 @@
     </div>
   </aside>
 </main>
-<script type="module" src="app.js?v=125"></script>
+<script type="module" src="app.js?v=126"></script>
 </body>
 </html>

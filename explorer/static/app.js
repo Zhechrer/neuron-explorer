@@ -1,6 +1,6 @@
 import { createMap } from "./map3d.js?v=79";
 import { createScatter } from "./scatter.js?v=39";
-import { t, tp, initI18n, applyTranslations, getLang } from "./i18n.js?v=1";
+import { t, tp, initI18n, applyTranslations, getLang } from "./i18n.js?v=2";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -17,6 +17,7 @@ let agentSelecting = false, agentMarked = false;  // Claude's selections and mar
 const state = { layer: null, units: {}, unitMap: {}, focus: null, unit: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
 const MUL_STEPS = [...Array.from({ length: 9 }, (_, i) => i * 0.5), 5, 6, 8, 12, 16];
+const exp = { items: [], runs: [], running: null };  // the experiment (see "experiment" below); declared early, syncTabs reads it
 
 const index = await api("/api/index");
 const arch = index.arch;
@@ -551,10 +552,10 @@ $("#focus-tab").onclick = () => focusEl.classList.contains("on") ? setFocusColla
 
 // ---------- focus panel ----------
 const focusEl = $("#focus");
-// closing the neuron keeps the panel up when Claude is the open tab
+// closing the neuron keeps the panel up when Claude or the experiment is the open tab
 $("#f-close").onclick = () => { flushName(); if (running) running.abort(); state.focus = null; $("#list").classList.remove("has-focus");
   map.selectHead(null); state.headInfo = null; state.nheads = null; $("#f-name").style.display = ""; lightHeads(state.inf.pos);
-  if (curTab() === "claude") syncTabs(); else focusEl.classList.remove("on");
+  if (curTab() === "claude" || curTab() === "experiment") syncTabs(); else focusEl.classList.remove("on");
   setFocusCollapsed(false); map.select(null); refreshWeb(); renderAgentActions(); scatter.select(null, null); saveFocus(); renderList(); };
 document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => setTab(b.dataset.tab));
 const tabBtn = t => $(`#tabs button[data-tab="${t}"]`);
@@ -574,6 +575,7 @@ function syncTabs() {
   for (const t of ["examples", "details"]) tabBtn(t).style.display = f ? "" : "none";
   tabBtn("chat").style.display = f && f.kind === "neuron" ? "" : "none";
   if (tabBtn(curTab()).style.display === "none") setTab(f ? "examples" : "claude");
+  syncExpButton();
 }
 function openClaude() {
   focusEl.classList.add("on"); syncTabs(); setTab("claude"); setFocusCollapsed(false); $("#a-input").focus();
@@ -845,6 +847,21 @@ function renderThread() {
 $("#c-clear").onclick = () => { if (running) running.abort(); state.thread = []; renderThread(); };
 let reading = false;
 
+// /api/steer streams server-sent events: {row, t} per text delta, then {row: null} (with error when it failed)
+async function readSteerEvents(res, onEvent) {
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let k;
+    while ((k = buf.indexOf("\n\n")) >= 0) {
+      const line = buf.slice(0, k); buf = buf.slice(k + 2);
+      if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
+    }
+  }
+}
+
 $("#c-form").addEventListener("submit", async e => {
   e.preventDefault();
   if (running) { running.abort(); return; }
@@ -862,23 +879,13 @@ $("#c-form").addEventListener("submit", async e => {
     const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
       body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history }) });
     if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let k;
-      while ((k = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, k); buf = buf.slice(k + 2);
-        if (!line.startsWith("data: ")) continue;
-        const ev = JSON.parse(line.slice(6));
-        if (ev.error) turn.error = ev.error;
-        if (ev.row == null) continue;
-        turn.replies[ev.row] += ev.t;
-        cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
-        const th = $("#c-thread"); if (th.scrollHeight - th.scrollTop - th.clientHeight < 80) th.scrollTop = th.scrollHeight;
-      }
-    }
+    await readSteerEvents(res, ev => {
+      if (ev.error) turn.error = ev.error;
+      if (ev.row == null) return;
+      turn.replies[ev.row] += ev.t;
+      cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
+      const th = $("#c-thread"); if (th.scrollHeight - th.scrollTop - th.clientHeight < 80) th.scrollTop = th.scrollHeight;
+    });
   } catch (err) {
     if (err.name !== "AbortError") turn.error = String(err);
   } finally {
@@ -902,6 +909,122 @@ async function runReads(f, text) {
     return `<span style="background:${c}" title="${u.pieces.map(v => v.toFixed(3)).join(" · ")}">${esc(u.text)}</span>`;
   }).join("");
 }
+
+// ---------- experiment ----------
+// a recipe of neurons pushed together, [{layer, n, mode, dose, enabled}], kept in localStorage. Run sends the enabled
+// ones to /api/steer at once: row 1 (unsteered) is the baseline and row 0 (every push) the experiment, from one batch
+// with the same prompt and settings; row 2 (each push reversed) comes with the batch and isn't shown. Pushes last only
+// for that generation; the model's weights never change.
+const EXP_KEY = "nl.experiment";
+const okExpItem = x => x && Number.isInteger(x.layer) && x.layer >= 0 && x.layer < arch.n_layers && Number.isInteger(x.n) &&
+  x.n >= 0 && x.n < arch.inter && (x.mode === "add" || x.mode === "mul") && Number.isFinite(x.dose);
+try {
+  const v = JSON.parse(localStorage.getItem(EXP_KEY) || "[]");
+  if (Array.isArray(v)) exp.items = v.filter(okExpItem).map(x => ({ layer: x.layer, n: x.n, mode: x.mode, dose: x.dose, enabled: x.enabled !== false }));
+} catch {}
+const expItem = (layer, n) => exp.items.find(x => x.layer === layer && x.n === n);
+const expMuted = x => x.mode === "mul" && x.dose === 0;
+const fmtPush = x => x.mode === "mul" ? `×${x.dose}` : fmtDose(x.dose);
+const parseDose = s => parseFloat(String(s).replace(/[×x*+\s]/g, "").replace("−", "-"));
+
+function syncExp() {
+  try { localStorage.setItem(EXP_KEY, JSON.stringify(exp.items)); } catch {}
+  map.setExperiment(exp.items.filter(x => x.enabled).map(x => ({ layer: x.layer, n: x.n, state: expMuted(x) ? "muted" : "modified" })));
+  const on = exp.items.filter(x => x.enabled).length;
+  document.querySelectorAll(".x-count").forEach(el => { el.textContent = exp.items.length ? ` · ${on}${on < exp.items.length ? `/${exp.items.length}` : ""}` : ""; });
+  $("#x-msg").textContent = "";
+  syncExpButton(); renderRecipe();
+}
+function syncExpButton() {
+  const f = state.focus, b = $("#f-exp"), has = !!f && exp.items.some(x => x.layer === f.layer && x.n === f.n);
+  b.style.display = f?.kind === "neuron" ? "" : "none";
+  b.textContent = has ? t("exp.added") : t("exp.add");
+  b.classList.toggle("on", has);
+}
+function renderRecipe() {
+  const el = $("#x-recipe");
+  if (!exp.items.length) { el.innerHTML = `<div class="x-empty dim">${t("exp.empty")}</div>`; return; }
+  el.innerHTML = exp.items.map((x, i) => `<div class="x-item${x.enabled ? (expMuted(x) ? " muted" : "") : " off"}" data-i="${i}">
+    <input type="checkbox" class="x-on"${x.enabled ? " checked" : ""} title="${t("exp.enabled")}" aria-label="${t("exp.enabled")}">
+    <button type="button" class="x-id mono" title="${t("exp.open")}">L${x.layer} N${x.n}</button>
+    <span class="x-name">${esc(state.unitMap[x.layer]?.get(x.n)?.name || "")}</span>
+    <span class="seg x-mode"><button type="button" data-m="add"${x.mode === "add" ? ' class="on"' : ""}>${t("chat.add")}</button><button type="button" data-m="mul"${x.mode === "mul" ? ' class="on"' : ""}>×</button></span>
+    <input class="x-dose mono" inputmode="decimal" value="${x.mode === "mul" ? `×${x.dose}` : (x.dose > 0 ? "+" : "") + x.dose}" aria-label="${t("chat.dose")}">
+    <button type="button" class="x-del" title="${t("exp.remove")}" aria-label="${t("exp.remove")}">×</button></div>`).join("");
+}
+function renderRuns() {
+  const el = $("#x-runs");
+  el.innerHTML = exp.runs.map(r => `<div class="turn">
+    <div class="user">${esc(r.prompt)}<span class="recipe">${r.recipe.map(x => `L${x.layer} N${x.n} ${x.mode === "mul" ? "" : `${t("chat.add")} `}${fmtPush(x)}`).join(" · ")}</span></div>
+    <div class="cols x-cols">${[[1, "zero", t("exp.baseline")], [0, "up", t("exp.experiment")]].map(([row, c, lab]) =>
+      `<div class="col ${c}${r.live ? " live" : ""}" data-row="${row}"><span class="lab">${lab}</span>${esc(r.replies[row])}</div>`).join("")}
+    ${r.error ? `<div class="err">${esc(r.error)}</div>` : ""}</div></div>`).join("");
+  el.scrollTop = el.scrollHeight;
+}
+function openExperiment() {
+  focusEl.classList.add("on"); syncTabs(); setTab("experiment"); setFocusCollapsed(false);
+}
+
+$("#x-recipe").addEventListener("change", e => {
+  const row = e.target.closest(".x-item"); if (!row) return;
+  const x = exp.items[+row.dataset.i];
+  if (e.target.classList.contains("x-on")) x.enabled = e.target.checked;
+  if (e.target.classList.contains("x-dose")) { const v = parseDose(e.target.value); if (Number.isFinite(v)) x.dose = v; }
+  syncExp();
+});
+$("#x-recipe").addEventListener("click", e => {
+  const row = e.target.closest(".x-item"); if (!row) return;
+  const i = +row.dataset.i, x = exp.items[i], b = e.target.closest("button");
+  if (!b) return;
+  if (b.classList.contains("x-del")) { exp.items.splice(i, 1); syncExp(); }
+  else if (b.dataset.m) { x.mode = b.dataset.m; syncExp(); }
+  else if (b.classList.contains("x-id")) openNeuron(x.layer, x.n);
+});
+// the open neuron joins with the chat's current mode and dose; a second press shows the experiment
+$("#f-exp").onclick = () => {
+  const f = state.focus; if (f?.kind !== "neuron") return;
+  if (expItem(f.layer, f.n)) return openExperiment();
+  const mode = state.chat.mode;
+  exp.items.push({ layer: f.layer, n: f.n, mode, dose: state.chat.dose[mode], enabled: true });
+  syncExp(); markFresh("experiment");
+};
+$("#x-open").onclick = openExperiment;
+$("#x-clear").onclick = () => { exp.items = []; syncExp(); };
+$("#x-clear-runs").onclick = () => { if (exp.running) exp.running.abort(); exp.runs = []; renderRuns(); };
+
+$("#x-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (exp.running) { exp.running.abort(); return; }
+  const recipe = exp.items.filter(x => x.enabled).map(({ layer, n, mode, dose }) => ({ layer, n, mode, dose }));
+  if (!recipe.length) { $("#x-msg").textContent = t("exp.noneEnabled"); return; }
+  const text = $("#x-input").value.trim() || $("#x-input").placeholder;
+  const run = { prompt: text, recipe, replies: ["", "", ""], live: true };
+  exp.runs.push(run); $("#x-input").value = ""; renderRuns();
+  const cols = {};
+  $("#x-runs").lastElementChild.querySelectorAll(".col").forEach(c => { cols[c.dataset.row] = c; });
+  const ctl = new AbortController();
+  exp.running = ctl; $("#x-go").textContent = t("chat.stop");
+  try {
+    const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
+      body: JSON.stringify({ neurons: recipe, prompt: text }) });
+    if (!res.ok) { let m = await res.text(); try { m = JSON.parse(m).error || m; } catch {} throw new Error(`${res.status}: ${String(m).slice(0, 200)}`); }
+    await readSteerEvents(res, ev => {
+      if (ev.error) run.error = ev.error;
+      if (ev.row == null) return;
+      run.replies[ev.row] += ev.t;
+      const c = cols[ev.row]; if (!c) return;
+      c.lastChild.nodeType === 3 ? (c.lastChild.textContent += ev.t) : c.append(ev.t);
+      const el = $("#x-runs"); if (el.scrollHeight - el.scrollTop - el.clientHeight < 80) el.scrollTop = el.scrollHeight;
+    });
+  } catch (err) {
+    if (err.name !== "AbortError") run.error = err.message || String(err);
+  } finally {
+    run.live = false;
+    if (exp.running === ctl) { exp.running = null; $("#x-go").textContent = t("chat.run"); }
+    if (exp.runs.includes(run)) renderRuns();
+  }
+});
+syncExp(); renderRuns();
 
 // ---------- status ----------
 // keeps polling (slowly once ready), so a server restart or a one-off error message clears itself
@@ -1353,6 +1476,9 @@ function relabel() {
   if (fireResults) renderResults(fireResults, $("#run-rows"));
   renderAgentActions();
   if (!running) renderThread();
+  syncExp();
+  $("#x-go").textContent = exp.running ? t("chat.stop") : t("chat.run");
+  if (!exp.running) renderRuns();
   relabelAgentThread();
   if (agent.pending.length) renderPending();
   if (pastStash !== null) renderPastList();
