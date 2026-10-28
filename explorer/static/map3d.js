@@ -46,6 +46,23 @@ function glowPoints(sizePx, maxScale = 3) {
   });
 }
 
+// solid discs with a dark rim, blended normally: their colour stays readable on bright sheets, where glow points
+// (additive) wash out to white
+function ringPoints(sizePx, maxScale = 3) {
+  return new THREE.RawShaderMaterial({
+    uniforms: { size: { value: sizePx * Math.min(devicePixelRatio, 2) }, ref: { value: 1 }, maxScale: { value: maxScale }, tdist: { value: 1 } },
+    vertexShader: `precision highp float;
+      uniform mat4 modelViewMatrix, projectionMatrix; uniform float size, ref, maxScale;
+      attribute vec3 position; attribute vec3 color; varying vec3 vC;
+      void main() { vec4 mv = modelViewMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * mv;
+        vC = color; gl_PointSize = size * clamp(sqrt(ref / -mv.z), 0.6, maxScale); }`,
+    fragmentShader: `precision highp float; varying vec3 vC;
+      void main() { float r = length(gl_PointCoord - 0.5); if (r > 0.5) discard;
+        gl_FragColor = vec4(mix(vC, vec3(0.0), smoothstep(0.3, 0.36, r)), 1.0); }`,
+    transparent: true, depthTest: false, depthWrite: false,
+  });
+}
+
 export function createMap(canvas, labelsDiv, arch, cb) {
   const L = arch.n_layers, N = arch.inter;
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -252,6 +269,12 @@ export function createMap(canvas, labelsDiv, arch, cb) {
   const markPts = new THREE.Points(markGeo, glowPoints(4, 2));
   markPts.frustumCulled = false; markPts.renderOrder = 1;
   scene.add(markPts);
+  // the experiment's neurons (setExperiment): a layer of their own, so lens, run and agent marks never replace them
+  const expGeo = new THREE.BufferGeometry();
+  const expPts = new THREE.Points(expGeo, ringPoints(7, 2.5));
+  expPts.frustumCulled = false; expPts.renderOrder = 4;
+  scene.add(expPts);
+  const EXP_COLOR = { modified: new THREE.Color(0.35, 1.0, 0.55), muted: new THREE.Color(1.0, 0.22, 0.2) };
 
   function refreshHighlights() {
     const p = [], c = [];
@@ -338,7 +361,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (pending) return; pending = true;
     requestAnimationFrame(() => {
       pending = false;
-      for (const m of [pointMat, hiMat, markPts.material, webPts.material]) { m.uniforms.ref.value = homeDist; m.uniforms.tdist.value = curDist(); }
+      for (const m of [pointMat, hiMat, markPts.material, expPts.material, webPts.material]) { m.uniforms.ref.value = homeDist; m.uniforms.tdist.value = curDist(); }
       applyFade();
       renderer.render(scene, camera); placeNotes();
     });
@@ -445,7 +468,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     if (dx * fade.side / GAP > 0.45) return 1 - fade.amt;
     return 1 - 0.75 * fade.amt * (1 - Math.exp(-d * d));
   };
-  let layerMode = null, saved = null, lastMarks = [];
+  let layerMode = null, saved = null, lastMarks = [], lastExp = [];
   function enterLayer(l) {
     if (layerMode === null) saved = { pos: camera.position.clone(), tgt: controls.target.clone() };
     layerMode = l;
@@ -608,7 +631,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     focusLayer() {},
     setLayout(cells) {
       layoutCells = cells;
-      this.setMarks(lastMarks);
+      this.setMarks(lastMarks); this.setExperiment(lastExp);
       for (let l = 0; l < L; l++) for (let n = 0; n < N; n++) {
         const p = neuronPos(l, n), k = (l * N + n) * 3;
         pos[k] = p.x; pos[k + 1] = p.y; pos[k + 2] = p.z;
@@ -636,6 +659,19 @@ export function createMap(canvas, labelsDiv, arch, cb) {
       }
       markGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
       markGeo.setAttribute("color", new THREE.Float32BufferAttribute(c, 3));
+      render();
+    },
+    // experiment neurons, [{layer, n, state: "modified" | "muted"}]; anything else stays as it is drawn normally
+    setExperiment(items) {
+      lastExp = items;
+      const p = [], c = [];
+      for (const it of items) {
+        const k = EXP_COLOR[it.state]; if (!k) continue;
+        const v = neuronPos(it.layer, it.n);
+        p.push(v.x, v.y, v.z); c.push(k.r, k.g, k.b);
+      }
+      expGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+      expGeo.setAttribute("color", new THREE.Float32BufferAttribute(c, 3));
       render();
     },
     setInsets(left, right) { insets.left = left; insets.right = right; resize(); },
